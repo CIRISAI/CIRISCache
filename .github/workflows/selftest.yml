@@ -1,0 +1,69 @@
+name: selftest
+
+# Proves the ORAS <-> GHCR roundtrip end-to-end using only the repo's own
+# GITHUB_TOKEN (which can push to this repo's own org package). Seeds fake cache
+# content, saves it, wipes it, restores it, and asserts it came back byte-for-byte.
+# This validates the mechanism without needing any cross-repo access grant.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Seed deterministic "cache" content under the real cache locations.
+      - name: Seed fake cache
+        run: |
+          mkdir -p ~/.cargo/registry/cache target/deps
+          echo "marker-${GITHUB_SHA}" > target/deps/ciriscache_marker.txt
+          head -c 1048576 /dev/urandom > ~/.cargo/registry/cache/blob.bin
+          sha256sum target/deps/ciriscache_marker.txt ~/.cargo/registry/cache/blob.bin > /tmp/before.sha
+
+      - name: Save
+        uses: ./save
+        with:
+          package: ghcr.io/cirisai/ciriscache-selftest
+          key: selftest-${{ github.run_id }}-${{ github.run_attempt }}
+          paths: "~/.cargo/registry/cache target/deps"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wipe local copies
+        run: rm -rf ~/.cargo/registry/cache target
+
+      - name: Restore
+        id: restore
+        uses: ./restore
+        with:
+          package: ghcr.io/cirisai/ciriscache-selftest
+          key: selftest-${{ github.run_id }}-${{ github.run_attempt }}
+          token: ${{ secrets.GITHUB_TOKEN }}   # selftest package is private → auth pull
+
+      - name: Assert roundtrip
+        run: |
+          set -euo pipefail
+          test "${{ steps.restore.outputs.cache-hit }}" = "true" || { echo "expected a cache HIT"; exit 1; }
+          sha256sum -c /tmp/before.sha
+          grep -q "marker-${GITHUB_SHA}" target/deps/ciriscache_marker.txt
+          echo "✅ CIRISCache GHCR roundtrip verified (save → wipe → restore, content identical)"
+
+      - name: Miss path returns cleanly
+        id: miss
+        uses: ./restore
+        with:
+          package: ghcr.io/cirisai/ciriscache-selftest
+          key: definitely-not-a-real-key-${{ github.run_id }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          test "${{ steps.miss.outputs.cache-hit }}" = "false" || { echo "miss should report cache-hit=false"; exit 1; }
+          echo "✅ cold-miss handled cleanly"

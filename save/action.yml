@@ -1,0 +1,65 @@
+name: "CIRISCache save"
+description: "Save a CI build cache to a GHCR package (ORAS push of a tarball)."
+
+inputs:
+  package:
+    description: "GHCR package reference without the tag (lowercase)."
+    default: "ghcr.io/cirisai/ciriscache"
+  key:
+    description: "Explicit cache key (OCI tag). Must match what `restore` will use. Empty → auto-derive (per repo)."
+    default: ""
+  lockfiles:
+    description: "Space-separated files hashed into the auto key (when `key` is empty)."
+    default: "Cargo.lock"
+  prefix-key:
+    description: "Key namespace; bump to invalidate everything at once."
+    default: "v1"
+  paths:
+    description: "Space-separated dirs to cache. `~` and workspace-relative paths are expanded."
+    default: "~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db target"
+  token:
+    description: >
+      GHCR token with write:packages. Pass ${{ secrets.GITHUB_TOKEN }} from a job
+      with `permissions: packages: write` — the repo must be granted write access
+      to the package once (see docs/DESIGN.md). No PAT / org secret required.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: oras-project/setup-oras@v1
+    - id: k
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${{ inputs.key }}" ]; then
+          KEY="${{ inputs.key }}"
+        else
+          RUSTV=$(rustc -vV 2>/dev/null | sha256sum | cut -c1-12 || echo norustc)
+          LOCKH=$( (cat ${{ inputs.lockfiles }} 2>/dev/null || true) | sha256sum | cut -c1-16)
+          KEY="${{ inputs.prefix-key }}-${{ runner.os }}-${{ runner.arch }}-${RUSTV}-${LOCKH}"
+        fi
+        KEY=$(printf '%s' "$KEY" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | cut -c1-128)
+        echo "key=$KEY" >> "$GITHUB_OUTPUT"
+        echo "ref=${{ inputs.package }}:$KEY" >> "$GITHUB_OUTPUT"
+        echo "CIRISCache key: $KEY"
+    - id: push
+      shell: bash
+      env:
+        CIRISCACHE_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        REF="${{ steps.k.outputs.ref }}"
+        printf '%s' "${CIRISCACHE_TOKEN}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+        EXP=""
+        for p in ${{ inputs.paths }}; do
+          p="${p/#\~/$HOME}"
+          case "$p" in /*) ;; *) p="$GITHUB_WORKSPACE/$p";; esac
+          if [ -e "$p" ]; then EXP="$EXP $p"; else echo "CIRISCache: skip missing $p"; fi
+        done
+        if [ -z "$EXP" ]; then echo "CIRISCache: nothing to cache"; exit 0; fi
+        # -P keeps absolute paths so restore lands them back in place.
+        tar -czPf "${RUNNER_TEMP}/cache.tar.gz" $EXP
+        cd "${RUNNER_TEMP}"
+        oras push "$REF" cache.tar.gz:application/gzip
+        echo "CIRISCache: saved $REF ($(du -h cache.tar.gz | cut -f1))"

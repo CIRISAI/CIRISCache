@@ -1,0 +1,71 @@
+name: "CIRISCache restore"
+description: "Restore a CI build cache from a GHCR package (free, unlimited for public packages, shareable across repos)."
+
+inputs:
+  package:
+    description: "GHCR package reference without the tag (lowercase)."
+    default: "ghcr.io/cirisai/ciriscache"
+  key:
+    description: >
+      Explicit cache key (becomes the OCI tag). For CROSS-repo sharing pass a key
+      derived from inputs every repo shares (the substrate triple + rustc), NOT a
+      per-repo lockfile. Leave empty to auto-derive a per-repo key.
+    default: ""
+  lockfiles:
+    description: "Space-separated files hashed into the auto key (when `key` is empty)."
+    default: "Cargo.lock"
+  prefix-key:
+    description: "Key namespace; bump to invalidate everything at once."
+    default: "v1"
+  token:
+    description: "GHCR token. Omit for a public package (anonymous pull)."
+    default: ""
+
+outputs:
+  key:
+    description: "The resolved cache key (OCI tag)."
+    value: ${{ steps.k.outputs.key }}
+  cache-hit:
+    description: "true if a cache blob was pulled + extracted."
+    value: ${{ steps.pull.outputs.hit }}
+
+runs:
+  using: composite
+  steps:
+    - uses: oras-project/setup-oras@v1
+    - id: k
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${{ inputs.key }}" ]; then
+          KEY="${{ inputs.key }}"
+        else
+          RUSTV=$(rustc -vV 2>/dev/null | sha256sum | cut -c1-12 || echo norustc)
+          LOCKH=$( (cat ${{ inputs.lockfiles }} 2>/dev/null || true) | sha256sum | cut -c1-16)
+          KEY="${{ inputs.prefix-key }}-${{ runner.os }}-${{ runner.arch }}-${RUSTV}-${LOCKH}"
+        fi
+        # Sanitize to a valid OCI tag: lowercase, [a-z0-9_.-], <=128 chars.
+        KEY=$(printf '%s' "$KEY" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | cut -c1-128)
+        echo "key=$KEY" >> "$GITHUB_OUTPUT"
+        echo "ref=${{ inputs.package }}:$KEY" >> "$GITHUB_OUTPUT"
+        echo "CIRISCache key: $KEY"
+    - id: pull
+      shell: bash
+      env:
+        CIRISCACHE_TOKEN: ${{ inputs.token }}
+      run: |
+        set -uo pipefail
+        REF="${{ steps.k.outputs.ref }}"
+        if [ -n "${CIRISCACHE_TOKEN}" ]; then
+          printf '%s' "${CIRISCACHE_TOKEN}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+        fi
+        D="${RUNNER_TEMP}/ciriscache-dl"; rm -rf "$D"; mkdir -p "$D"
+        if oras pull "$REF" -o "$D" 2>/dev/null && [ -f "$D/cache.tar.gz" ]; then
+          # Tarball stores absolute paths (-P); extract them back in place.
+          tar -xzPf "$D/cache.tar.gz"
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          echo "CIRISCache: HIT  $REF"
+        else
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          echo "CIRISCache: miss $REF (cold build)"
+        fi
