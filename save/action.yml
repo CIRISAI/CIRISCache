@@ -19,9 +19,10 @@ inputs:
     default: "~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db target"
   token:
     description: >
-      GHCR token with write:packages. Pass ${{ secrets.GITHUB_TOKEN }} from a job
-      with `permissions: packages: write` — the repo must be granted write access
-      to the package once (see docs/DESIGN.md). No PAT / org secret required.
+      GHCR token with write:packages. Pass the job's GITHUB_TOKEN (the
+      secrets.GITHUB_TOKEN value) from a job with `permissions: packages: write`
+      — the repo must be granted write access to the package once (see
+      docs/DESIGN.md). No PAT / org secret required.
     required: true
 
 runs:
