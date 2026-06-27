@@ -59,13 +59,16 @@ runs:
         if [ -n "${CIRISCACHE_TOKEN}" ]; then
           printf '%s' "${CIRISCACHE_TOKEN}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
         fi
-        D="${RUNNER_TEMP}/ciriscache-dl"; rm -rf "$D"; mkdir -p "$D"
-        if oras pull "$REF" -o "$D" 2>/dev/null && [ -f "$D/cache.tar.gz" ]; then
-          # Tarball stores absolute paths (-P); extract them back in place.
-          # --force-local on Windows ONLY (GNU tar reads "D:" as a remote host;
-          # macOS BSD tar has no such flag — see save/action.yml).
-          FL=""; [ "${RUNNER_OS:-}" = "Windows" ] && FL="--force-local"
-          tar $FL -xzPf "$D/cache.tar.gz"
+        # oras is a native Windows binary (wants D:\... paths); tar/rm/mkdir are
+        # MSYS and want POSIX (/d/...). Keep both forms of the download dir.
+        DWIN="${RUNNER_TEMP}/ciriscache-dl"; DPX="$DWIN"; FL=""
+        if [ "${RUNNER_OS:-}" = "Windows" ]; then DPX="$(cygpath -u "${RUNNER_TEMP}")/ciriscache-dl"; FL="--force-local"; fi
+        rm -rf "$DPX"; mkdir -p "$DPX"
+        if oras pull "$REF" -o "$DWIN" 2>/dev/null && [ -f "$DPX/cache.tar.gz" ]; then
+          # Tarball stores absolute paths (-P); extract them back in place. On
+          # Windows MSYS tar needs --force-local + the POSIX archive path; macOS
+          # BSD tar has neither the flag nor the bug (see save/action.yml).
+          tar $FL -xzPf "$DPX/cache.tar.gz"
           echo "hit=true" >> "$GITHUB_OUTPUT"
           echo "CIRISCache: HIT  $REF"
         else

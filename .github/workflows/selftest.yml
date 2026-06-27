@@ -17,28 +17,41 @@ permissions:
 
 jobs:
   roundtrip:
-    runs-on: ubuntu-latest
+    # Exercise the real save -> wipe -> restore round-trip on every runner OS.
+    # Windows (MSYS git-bash GNU tar) is the one with the drive-letter/backslash
+    # path hazards (CIRISCache#1); macOS uses BSD tar (no --force-local). ubuntu
+    # is the GNU-tar/Linux baseline. fail-fast off so one OS failing still shows
+    # the others. Each OS uses a distinct key so the legs do not collide.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
       # Seed deterministic "cache" content under the real cache locations.
+      # cmp (not sha256sum) does the byte-identical check — portable across
+      # git-bash and macOS where sha256sum may be absent (it's shasum there).
       - name: Seed fake cache
+        shell: bash
         run: |
           mkdir -p ~/.cargo/registry/cache target/deps
           echo "marker-${GITHUB_SHA}" > target/deps/ciriscache_marker.txt
           head -c 1048576 /dev/urandom > ~/.cargo/registry/cache/blob.bin
-          sha256sum target/deps/ciriscache_marker.txt ~/.cargo/registry/cache/blob.bin > /tmp/before.sha
+          cp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
 
       - name: Save
         uses: ./save
         with:
           package: ghcr.io/cirisai/ciriscache-selftest
-          key: selftest-${{ github.run_id }}-${{ github.run_attempt }}
+          key: selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           paths: "~/.cargo/registry/cache target/deps"
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Wipe local copies
+        shell: bash
         run: rm -rf ~/.cargo/registry/cache target
 
       - name: Restore
@@ -46,24 +59,26 @@ jobs:
         uses: ./restore
         with:
           package: ghcr.io/cirisai/ciriscache-selftest
-          key: selftest-${{ github.run_id }}-${{ github.run_attempt }}
+          key: selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           token: ${{ secrets.GITHUB_TOKEN }}   # selftest package is private → auth pull
 
       - name: Assert roundtrip
+        shell: bash
         run: |
           set -euo pipefail
           test "${{ steps.restore.outputs.cache-hit }}" = "true" || { echo "expected a cache HIT"; exit 1; }
-          sha256sum -c /tmp/before.sha
+          cmp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
           grep -q "marker-${GITHUB_SHA}" target/deps/ciriscache_marker.txt
-          echo "✅ CIRISCache GHCR roundtrip verified (save → wipe → restore, content identical)"
+          echo "✅ CIRISCache GHCR roundtrip verified on ${{ matrix.os }} (save → wipe → restore, byte-identical)"
 
       - name: Miss path returns cleanly
         id: miss
         uses: ./restore
         with:
           package: ghcr.io/cirisai/ciriscache-selftest
-          key: definitely-not-a-real-key-${{ github.run_id }}
+          key: definitely-not-a-real-key-${{ matrix.os }}-${{ github.run_id }}
           token: ${{ secrets.GITHUB_TOKEN }}
-      - run: |
+      - shell: bash
+        run: |
           test "${{ steps.miss.outputs.cache-hit }}" = "false" || { echo "miss should report cache-hit=false"; exit 1; }
-          echo "✅ cold-miss handled cleanly"
+          echo "✅ cold-miss handled cleanly on ${{ matrix.os }}"

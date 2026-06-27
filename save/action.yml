@@ -56,16 +56,23 @@ runs:
         for p in ${{ inputs.paths }}; do
           p="${p/#\~/$HOME}"
           case "$p" in /*) ;; *) p="$GITHUB_WORKSPACE/$p";; esac
+          # Windows MSYS tar: normalize D:\a\... -> /d/a/... so there's no
+          # drive-letter colon (GNU tar reads "D:" as a remote rsh host —
+          # "Cannot connect to D:") and no backslashes. --force-local alone only
+          # covers the -f archive name, NOT the member operands, so it is not
+          # enough; cygpath the members too. macOS BSD tar has neither the flag
+          # nor the bug, so leave its paths untouched.
+          [ "${RUNNER_OS:-}" = "Windows" ] && p="$(cygpath -u "$p")"
           if [ -e "$p" ]; then EXP="$EXP $p"; else echo "CIRISCache: skip missing $p"; fi
         done
         if [ -z "$EXP" ]; then echo "CIRISCache: nothing to cache"; exit 0; fi
-        # -P keeps absolute paths so restore lands them back in place.
-        # --force-local on Windows ONLY: GNU tar (git-bash) reads the "D:" in the
-        # archive/member paths as a remote rsh host ("Cannot connect to D:"). macOS
-        # ships BSD tar, which has no such flag (and no such bug), so it must NOT be
-        # passed there.
-        FL=""; [ "${RUNNER_OS:-}" = "Windows" ] && FL="--force-local"
-        tar $FL -czPf "${RUNNER_TEMP}/cache.tar.gz" $EXP
-        cd "${RUNNER_TEMP}"
+        # -P keeps absolute paths so restore lands them back in place. On Windows
+        # use a POSIX archive path + --force-local (belt-and-suspenders); members
+        # are already cygpath'd above. oras is a native Windows binary, so it gets
+        # the unconverted RUNNER_TEMP (cd "$TMP" lands in the same physical dir).
+        TMP="${RUNNER_TEMP}"; FL=""
+        if [ "${RUNNER_OS:-}" = "Windows" ]; then TMP="$(cygpath -u "${RUNNER_TEMP}")"; FL="--force-local"; fi
+        tar $FL -czPf "$TMP/cache.tar.gz" $EXP
+        cd "$TMP"
         oras push "$REF" cache.tar.gz:application/gzip
         echo "CIRISCache: saved $REF ($(du -h cache.tar.gz | cut -f1))"
