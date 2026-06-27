@@ -60,7 +60,12 @@ runs:
         done
         if [ -z "$EXP" ]; then echo "CIRISCache: nothing to cache"; exit 0; fi
         # -P keeps absolute paths so restore lands them back in place.
-        tar -czPf "${RUNNER_TEMP}/cache.tar.gz" $EXP
+        # --force-local on Windows ONLY: GNU tar (git-bash) reads the "D:" in the
+        # archive/member paths as a remote rsh host ("Cannot connect to D:"). macOS
+        # ships BSD tar, which has no such flag (and no such bug), so it must NOT be
+        # passed there.
+        FL=""; [ "${RUNNER_OS:-}" = "Windows" ] && FL="--force-local"
+        tar $FL -czPf "${RUNNER_TEMP}/cache.tar.gz" $EXP
         cd "${RUNNER_TEMP}"
         oras push "$REF" cache.tar.gz:application/gzip
         echo "CIRISCache: saved $REF ($(du -h cache.tar.gz | cut -f1))"

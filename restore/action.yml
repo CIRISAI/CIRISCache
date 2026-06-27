@@ -62,7 +62,10 @@ runs:
         D="${RUNNER_TEMP}/ciriscache-dl"; rm -rf "$D"; mkdir -p "$D"
         if oras pull "$REF" -o "$D" 2>/dev/null && [ -f "$D/cache.tar.gz" ]; then
           # Tarball stores absolute paths (-P); extract them back in place.
-          tar -xzPf "$D/cache.tar.gz"
+          # --force-local on Windows ONLY (GNU tar reads "D:" as a remote host;
+          # macOS BSD tar has no such flag — see save/action.yml).
+          FL=""; [ "${RUNNER_OS:-}" = "Windows" ] && FL="--force-local"
+          tar $FL -xzPf "$D/cache.tar.gz"
           echo "hit=true" >> "$GITHUB_OUTPUT"
           echo "CIRISCache: HIT  $REF"
         else
