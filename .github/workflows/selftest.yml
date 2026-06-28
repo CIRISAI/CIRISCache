@@ -105,3 +105,25 @@ jobs:
             || { echo "multi-key: key output should be the matched 2nd key, got '${{ steps.multi.outputs.key }}'"; exit 1; }
           cmp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
           echo "✅ multi-key first-hit-wins verified on ${{ matrix.os }} (skipped the missing key, restored the hit)"
+
+      # v2 prefix `*`: an entry ending in `*` resolves to the most-recent matching
+      # tag (version-sorted). First an exact miss, then the run-id prefix → the
+      # saved tag is the only match, so it must restore.
+      - name: Wipe again before prefix restore
+        shell: bash
+        run: rm -rf ~/.cargo/registry/cache target
+      - name: Restore (prefix * — most-recent match)
+        id: pfx
+        uses: ./restore
+        with:
+          package: ghcr.io/cirisai/ciriscache-selftest
+          keys: |
+            no-such-exact-${{ matrix.os }}-${{ github.run_id }}
+            selftest-${{ matrix.os }}-${{ github.run_id }}-*
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.pfx.outputs.cache-hit }}" = "true" || { echo "prefix: expected a HIT via most-recent match"; exit 1; }
+          cmp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
+          echo "✅ prefix most-recent (*) verified on ${{ matrix.os }} — resolved '${{ steps.pfx.outputs.key }}'"

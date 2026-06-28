@@ -16,6 +16,11 @@ inputs:
       DEEPEST layer first (e.g. server → edge → persist → verify). The first key
       that hits is restored; the rest are skipped (one extraction, not N
       cumulative ones). Takes precedence over `key`.
+
+      An entry ending in `*` is a PREFIX: the most-recent matching tag (version-
+      sorted) is restored. Use it to fall back to the latest server `-s<version>`
+      blob (lean + complete) before the much larger edge layer — e.g.
+      `…-v8.3.0-s*` after the exact `…-s0.5.66`.
     default: ""
   key:
     description: >
@@ -66,10 +71,11 @@ runs:
             RAW="${{ inputs.prefix-key }}-${{ runner.os }}-${{ runner.arch }}-${RUSTV}-${LOCKH}"
           fi
         fi
-        # Sanitize each to a valid OCI tag (lowercase, [a-z0-9_.-], <=128); keep order.
+        # Sanitize each to a valid OCI tag (lowercase, [a-z0-9_.-], <=128); keep
+        # order. `*` is preserved (a trailing `*` marks a most-recent-prefix entry).
         KEYS=()
         for k in $RAW; do
-          k=$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | cut -c1-128)
+          k=$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-*' '-' | cut -c1-128)
           [ -n "$k" ] && KEYS+=("$k")
         done
         if [ ${#KEYS[@]} -eq 0 ]; then
@@ -87,10 +93,27 @@ runs:
 
         # ── Try each key in PRIORITY order; FIRST hit wins, then STOP ─────────
         # The deepest layer that exists is a superset of the shallower ones, so a
-        # single extraction is sufficient — no cumulative re-extraction.
+        # single extraction is sufficient — no cumulative re-extraction. A trailing
+        # `*` resolves to the most-recent matching tag (version-sorted) — used to
+        # prefer the latest lean server `-s` blob over the larger edge layer.
         n=${#KEYS[@]}
+        TAGS=""
         for KEY in "${KEYS[@]}"; do
-          REF="${PKG}:${KEY}"
+          RESOLVED="$KEY"
+          case "$KEY" in
+            *\*)
+              PFX="${KEY%\*}"
+              # List the package's tags ONCE; pick the most-recent (highest-version) match.
+              [ -z "$TAGS" ] && TAGS=$(oras repo tags "$PKG" 2>/dev/null || true)
+              RESOLVED=$(printf '%s\n' "$TAGS" | while IFS= read -r t; do case "$t" in "$PFX"*) echo "$t";; esac; done | sort -V | tail -1)
+              if [ -z "$RESOLVED" ]; then
+                echo "CIRISCache: miss ${PKG}:${KEY} (no tag matches prefix '${PFX}')"
+                continue
+              fi
+              echo "CIRISCache: prefix '${PFX}*' → most-recent '${RESOLVED}'"
+              ;;
+          esac
+          REF="${PKG}:${RESOLVED}"
           rm -rf "$DPX"; mkdir -p "$DPX"
           if oras pull "$REF" -o "$DWIN" 2>/dev/null && [ -f "$DPX/cache.tar.gz" ]; then
             # Tarball stores absolute paths (-P); extract in place. Windows MSYS
@@ -98,12 +121,12 @@ runs:
             # neither the flag nor the bug (see save/action.yml).
             tar $FL -xzPf "$DPX/cache.tar.gz"
             echo "hit=true" >> "$GITHUB_OUTPUT"
-            echo "matched=$KEY" >> "$GITHUB_OUTPUT"
+            echo "matched=$RESOLVED" >> "$GITHUB_OUTPUT"
             echo "CIRISCache: HIT  $REF  (first hit of $n key(s); deeper-or-equal layer restored, shallower skipped)"
             exit 0
           fi
           echo "CIRISCache: miss $REF"
         done
         echo "hit=false" >> "$GITHUB_OUTPUT"
-        echo "matched=${KEYS[0]}" >> "$GITHUB_OUTPUT"
+        echo "matched=${KEYS[0]%\*}" >> "$GITHUB_OUTPUT"
         echo "CIRISCache: miss ALL $n key(s) (cold build)"
