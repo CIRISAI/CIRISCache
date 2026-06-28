@@ -103,9 +103,23 @@ runs:
           case "$KEY" in
             *\*)
               PFX="${KEY%\*}"
-              # List the package's tags ONCE; pick the most-recent (highest-version) match.
+              # List the package's tags ONCE; pick the most-recent (highest version)
+              # match. Version compare is portable (NO `sort -V` — BSD/macOS sort
+              # lacks it): strip the prefix, zero-pad each dot-component, lexically
+              # max via bash [[ > ]]. Non-numeric components coerce to 0 (awk $n+0).
               [ -z "$TAGS" ] && TAGS=$(oras repo tags "$PKG" 2>/dev/null || true)
-              RESOLVED=$(printf '%s\n' "$TAGS" | while IFS= read -r t; do case "$t" in "$PFX"*) echo "$t";; esac; done | sort -V | tail -1)
+              RESOLVED=""; BESTKEY=""
+              # Process substitution (not a pipe) so the loop runs in THIS shell and
+              # RESOLVED/BESTKEY persist; works on macOS bash 3.2 (no mapfile).
+              while IFS= read -r t; do
+                case "$t" in
+                  "$PFX"*)
+                    v="${t#"$PFX"}"
+                    vk=$(printf '%s' "$v" | awk -F. '{printf "%010d%010d%010d%010d", $1+0,$2+0,$3+0,$4+0}')
+                    if [ -z "$BESTKEY" ] || [[ "$vk" > "$BESTKEY" ]]; then BESTKEY="$vk"; RESOLVED="$t"; fi
+                    ;;
+                esac
+              done < <(printf '%s\n' "$TAGS")
               if [ -z "$RESOLVED" ]; then
                 echo "CIRISCache: miss ${PKG}:${KEY} (no tag matches prefix '${PFX}')"
                 continue
