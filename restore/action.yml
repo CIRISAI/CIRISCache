@@ -1,18 +1,29 @@
 name: "CIRISCache restore"
-description: "Restore a CI build cache from a GHCR package (free, unlimited for public packages, shareable across repos)."
+description: >
+  Restore a CI build cache from a GHCR package (free, unlimited for public
+  packages, shareable across repos). v2: pass an ordered `keys` list — the FIRST
+  key that hits is restored and the rest are SKIPPED. For a layered substrate
+  cache the deepest blob is a superset of the shallower ones, so restoring just
+  the first hit avoids redundant cumulative extraction.
 
 inputs:
   package:
     description: "GHCR package reference without the tag (lowercase)."
     default: "ghcr.io/cirisai/ciriscache"
+  keys:
+    description: >
+      Newline- or space-separated cache keys in PRIORITY order — most-specific /
+      DEEPEST layer first (e.g. server → edge → persist → verify). The first key
+      that hits is restored; the rest are skipped (one extraction, not N
+      cumulative ones). Takes precedence over `key`.
+    default: ""
   key:
     description: >
-      Explicit cache key (becomes the OCI tag). For CROSS-repo sharing pass a key
-      derived from inputs every repo shares (the substrate triple + rustc), NOT a
-      per-repo lockfile. Leave empty to auto-derive a per-repo key.
+      Single explicit key (v1 back-compat). Used only when `keys` is empty. Empty
+      AND no `keys` → auto-derive a per-repo key from rustc + lockfiles.
     default: ""
   lockfiles:
-    description: "Space-separated files hashed into the auto key (when `key` is empty)."
+    description: "Space-separated files hashed into the auto key (when neither `keys` nor `key` is set)."
     default: "Cargo.lock"
   prefix-key:
     description: "Key namespace; bump to invalidate everything at once."
@@ -23,55 +34,76 @@ inputs:
 
 outputs:
   key:
-    description: "The resolved cache key (OCI tag)."
-    value: ${{ steps.k.outputs.key }}
+    description: "The key that was restored (the first hit), or the first resolved key on a full miss."
+    value: ${{ steps.pull.outputs.matched }}
   cache-hit:
-    description: "true if a cache blob was pulled + extracted."
+    description: "true if any key hit + extracted."
     value: ${{ steps.pull.outputs.hit }}
 
 runs:
   using: composite
   steps:
     - uses: oras-project/setup-oras@v1
-    - id: k
-      shell: bash
-      run: |
-        set -euo pipefail
-        if [ -n "${{ inputs.key }}" ]; then
-          KEY="${{ inputs.key }}"
-        else
-          RUSTV=$(rustc -vV 2>/dev/null | sha256sum | cut -c1-12 || echo norustc)
-          LOCKH=$( (cat ${{ inputs.lockfiles }} 2>/dev/null || true) | sha256sum | cut -c1-16)
-          KEY="${{ inputs.prefix-key }}-${{ runner.os }}-${{ runner.arch }}-${RUSTV}-${LOCKH}"
-        fi
-        # Sanitize to a valid OCI tag: lowercase, [a-z0-9_.-], <=128 chars.
-        KEY=$(printf '%s' "$KEY" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | cut -c1-128)
-        echo "key=$KEY" >> "$GITHUB_OUTPUT"
-        echo "ref=${{ inputs.package }}:$KEY" >> "$GITHUB_OUTPUT"
-        echo "CIRISCache key: $KEY"
     - id: pull
       shell: bash
       env:
         CIRISCACHE_TOKEN: ${{ inputs.token }}
+        IN_KEYS: ${{ inputs.keys }}
+        IN_KEY: ${{ inputs.key }}
       run: |
         set -uo pipefail
-        REF="${{ steps.k.outputs.ref }}"
+        PKG="${{ inputs.package }}"
+
+        # ── Resolve the ordered key list ──────────────────────────────────────
+        # `keys` (plural, priority order) wins; else single `key`; else auto-derive.
+        RAW="$IN_KEYS"
+        if [ -z "${RAW//[[:space:]]/}" ]; then
+          if [ -n "$IN_KEY" ]; then
+            RAW="$IN_KEY"
+          else
+            RUSTV=$(rustc -vV 2>/dev/null | sha256sum | cut -c1-12 || echo norustc)
+            LOCKH=$( (cat ${{ inputs.lockfiles }} 2>/dev/null || true) | sha256sum | cut -c1-16)
+            RAW="${{ inputs.prefix-key }}-${{ runner.os }}-${{ runner.arch }}-${RUSTV}-${LOCKH}"
+          fi
+        fi
+        # Sanitize each to a valid OCI tag (lowercase, [a-z0-9_.-], <=128); keep order.
+        KEYS=()
+        for k in $RAW; do
+          k=$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | cut -c1-128)
+          [ -n "$k" ] && KEYS+=("$k")
+        done
+        if [ ${#KEYS[@]} -eq 0 ]; then
+          echo "hit=false" >> "$GITHUB_OUTPUT"; echo "matched=" >> "$GITHUB_OUTPUT"
+          echo "CIRISCache: no keys to restore"; exit 0
+        fi
+
         if [ -n "${CIRISCACHE_TOKEN}" ]; then
           printf '%s' "${CIRISCACHE_TOKEN}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
         fi
         # oras is a native Windows binary (wants D:\... paths); tar/rm/mkdir are
-        # MSYS and want POSIX (/d/...). Keep both forms of the download dir.
+        # MSYS and want POSIX (/d/...) — keep both forms (CIRISCache#1).
         DWIN="${RUNNER_TEMP}/ciriscache-dl"; DPX="$DWIN"; FL=""
         if [ "${RUNNER_OS:-}" = "Windows" ]; then DPX="$(cygpath -u "${RUNNER_TEMP}")/ciriscache-dl"; FL="--force-local"; fi
-        rm -rf "$DPX"; mkdir -p "$DPX"
-        if oras pull "$REF" -o "$DWIN" 2>/dev/null && [ -f "$DPX/cache.tar.gz" ]; then
-          # Tarball stores absolute paths (-P); extract them back in place. On
-          # Windows MSYS tar needs --force-local + the POSIX archive path; macOS
-          # BSD tar has neither the flag nor the bug (see save/action.yml).
-          tar $FL -xzPf "$DPX/cache.tar.gz"
-          echo "hit=true" >> "$GITHUB_OUTPUT"
-          echo "CIRISCache: HIT  $REF"
-        else
-          echo "hit=false" >> "$GITHUB_OUTPUT"
-          echo "CIRISCache: miss $REF (cold build)"
-        fi
+
+        # ── Try each key in PRIORITY order; FIRST hit wins, then STOP ─────────
+        # The deepest layer that exists is a superset of the shallower ones, so a
+        # single extraction is sufficient — no cumulative re-extraction.
+        n=${#KEYS[@]}
+        for KEY in "${KEYS[@]}"; do
+          REF="${PKG}:${KEY}"
+          rm -rf "$DPX"; mkdir -p "$DPX"
+          if oras pull "$REF" -o "$DWIN" 2>/dev/null && [ -f "$DPX/cache.tar.gz" ]; then
+            # Tarball stores absolute paths (-P); extract in place. Windows MSYS
+            # tar needs --force-local + the POSIX archive path; macOS BSD tar has
+            # neither the flag nor the bug (see save/action.yml).
+            tar $FL -xzPf "$DPX/cache.tar.gz"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "matched=$KEY" >> "$GITHUB_OUTPUT"
+            echo "CIRISCache: HIT  $REF  (first hit of $n key(s); deeper-or-equal layer restored, shallower skipped)"
+            exit 0
+          fi
+          echo "CIRISCache: miss $REF"
+        done
+        echo "hit=false" >> "$GITHUB_OUTPUT"
+        echo "matched=${KEYS[0]}" >> "$GITHUB_OUTPUT"
+        echo "CIRISCache: miss ALL $n key(s) (cold build)"

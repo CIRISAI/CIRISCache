@@ -82,3 +82,26 @@ jobs:
         run: |
           test "${{ steps.miss.outputs.cache-hit }}" = "false" || { echo "miss should report cache-hit=false"; exit 1; }
           echo "✅ cold-miss handled cleanly on ${{ matrix.os }}"
+
+      # v2 multi-key first-hit-wins: a priority list whose first key MISSES and a
+      # later key HITS must restore the later one (and report it via `key`).
+      - name: Wipe again before multi-key restore
+        shell: bash
+        run: rm -rf ~/.cargo/registry/cache target
+      - name: Restore (multi-key — first misses, second hits)
+        id: multi
+        uses: ./restore
+        with:
+          package: ghcr.io/cirisai/ciriscache-selftest
+          keys: |
+            no-such-key-${{ matrix.os }}-${{ github.run_id }}
+            selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.multi.outputs.cache-hit }}" = "true" || { echo "multi-key: expected the 2nd key to HIT"; exit 1; }
+          test "${{ steps.multi.outputs.key }}" = "selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}" \
+            || { echo "multi-key: key output should be the matched 2nd key, got '${{ steps.multi.outputs.key }}'"; exit 1; }
+          cmp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
+          echo "✅ multi-key first-hit-wins verified on ${{ matrix.os }} (skipped the missing key, restored the hit)"
