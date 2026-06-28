@@ -75,7 +75,7 @@ runs:
         # order. `*` is preserved (a trailing `*` marks a most-recent-prefix entry).
         KEYS=()
         for k in $RAW; do
-          k=$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-*' '-' | cut -c1-128)
+          k=$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]' | tr -c '*a-z0-9_.-' '-' | cut -c1-128)
           [ -n "$k" ] && KEYS+=("$k")
         done
         if [ ${#KEYS[@]} -eq 0 ]; then
