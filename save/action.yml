@@ -8,6 +8,17 @@ inputs:
   key:
     description: "Explicit cache key (OCI tag). Must match what `restore` will use. Empty → auto-derive (per repo)."
     default: ""
+  alias-keys:
+    description: >
+      Extra OCI tags to point at the SAME manifest this save pushes, space/
+      newline-separated. Applied as a registry-side `oras tag` of the pushed
+      digest — NO second tar/gzip/upload. Use when one build's target/ must be
+      reachable under several keys (e.g. a versioned exact-pin AND a rolling
+      `phead`): push the blob once, alias the rest. Replaces the N-full-saves-of-
+      identical-content pattern (CIRISPersist#458 — the double ~9-min save was
+      two tar+push cycles of byte-identical target/). A retag failure is
+      non-fatal (logged as a warning); the primary save still counts.
+    default: ""
   lockfiles:
     description: "Space-separated files hashed into the auto key (when `key` is empty)."
     default: "Cargo.lock"
@@ -50,6 +61,28 @@ runs:
         CIRISCACHE_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
+        # Portable step-internal timeout (CIRISPersist#458 — fail-open save). A
+        # HUNG `oras push`/`oras tag` (dead GHCR / stalled upload) would otherwise
+        # freeze the step until the JOB timeout, delaying (and on a tag run,
+        # orphaning) the release. `timeout(1)` isn't portable (absent on macOS
+        # runners; Windows `timeout.exe` differs), so use a bash watchdog: run in
+        # the background, SIGTERM after N seconds, return the real rc (124 on
+        # watchdog fire). The caller wraps save in `continue-on-error: true`, so a
+        # timed-out push is non-fatal. Watchdog stdout → /dev/null so it can't
+        # hold a `$(…)` capture pipe open.
+        _cc_timeout() {
+          local secs="$1"; shift
+          "$@" &
+          local cmdpid=$!
+          ( sleep "$secs"; kill -TERM "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
+          local wdpid=$!
+          local rc=0
+          wait "$cmdpid" 2>/dev/null || rc=$?
+          kill -TERM "$wdpid" 2>/dev/null
+          wait "$wdpid" 2>/dev/null || true
+          [ "$rc" -ge 128 ] && return 124
+          return "$rc"
+        }
         REF="${{ steps.k.outputs.ref }}"
         printf '%s' "${CIRISCACHE_TOKEN}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
         EXP=""
@@ -74,5 +107,22 @@ runs:
         if [ "${RUNNER_OS:-}" = "Windows" ]; then TMP="$(cygpath -u "${RUNNER_TEMP}")"; FL="--force-local"; fi
         tar $FL -czPf "$TMP/cache.tar.gz" $EXP
         cd "$TMP"
-        oras push "$REF" cache.tar.gz:application/gzip
+        _cc_timeout 1200 oras push "$REF" cache.tar.gz:application/gzip
         echo "CIRISCache: saved $REF ($(du -h cache.tar.gz | cut -f1))"
+        # Registry-side retag: point each alias key at the SAME manifest we just
+        # pushed — no re-tar / re-gzip / re-upload of the (byte-identical)
+        # target/. `oras tag` adds tags to the existing remote digest server-side
+        # (~1s), moving the tag if it already exists (correct for a rolling
+        # `phead`). CIRISPersist#458: the double ~9-min save was two full
+        # tar+push cycles of identical content; this collapses it to push-once +
+        # alias. A retag failure is non-fatal — the primary $REF is already saved.
+        PKG="${REF%:*}"
+        for ALIAS in ${{ inputs.alias-keys }}; do
+          ALIAS=$(printf '%s' "$ALIAS" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | cut -c1-128)
+          [ -z "$ALIAS" ] && continue
+          if _cc_timeout 60 oras tag "$REF" "$ALIAS"; then
+            echo "CIRISCache: aliased ${PKG}:${ALIAS} → same manifest as $REF (no re-upload)"
+          else
+            echo "::warning::CIRISCache: alias retag failed for ${PKG}:${ALIAS} (non-fatal; primary save intact)"
+          fi
+        done

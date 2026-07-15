@@ -59,6 +59,32 @@ runs:
         set -uo pipefail
         PKG="${{ inputs.package }}"
 
+        # Portable step-internal timeout (CIRISPersist#458 — fail-open restore).
+        # A HUNG oras call (dead GHCR endpoint / stalled network) previously
+        # froze this step `in_progress` and killed the job — and with it a
+        # tag-gated PyPI publish. `continue-on-error` only catches a non-zero
+        # EXIT, never a hang. `timeout(1)` isn't portable (absent on macOS
+        # runners; the Windows `timeout.exe` has unrelated console semantics), so
+        # this is a bash watchdog that works on GNU + macOS bash 3.2 + git-bash:
+        # run the command in the background, SIGTERM it after N seconds, return
+        # its real rc (or 124 if the watchdog fired). Callers treat a non-zero rc
+        # as a miss → next key → cold build. The watchdog's stdout is sent to
+        # /dev/null so it never holds a `$(…)` capture pipe open (which would make
+        # command substitution block for the full timeout).
+        _cc_timeout() {
+          local secs="$1"; shift
+          "$@" &
+          local cmdpid=$!
+          ( sleep "$secs"; kill -TERM "$cmdpid" 2>/dev/null ) >/dev/null 2>&1 &
+          local wdpid=$!
+          local rc=0
+          wait "$cmdpid" 2>/dev/null || rc=$?
+          kill -TERM "$wdpid" 2>/dev/null
+          wait "$wdpid" 2>/dev/null || true
+          [ "$rc" -ge 128 ] && return 124
+          return "$rc"
+        }
+
         # ── Resolve the ordered key list ──────────────────────────────────────
         # `keys` (plural, priority order) wins; else single `key`; else auto-derive.
         RAW="$IN_KEYS"
@@ -107,7 +133,7 @@ runs:
               # match. Version compare is portable (NO `sort -V` — BSD/macOS sort
               # lacks it): strip the prefix, zero-pad each dot-component, lexically
               # max via bash [[ > ]]. Non-numeric components coerce to 0 (awk $n+0).
-              [ -z "$TAGS" ] && TAGS=$(oras repo tags "$PKG" 2>/dev/null || true)
+              [ -z "$TAGS" ] && TAGS=$(_cc_timeout 60 oras repo tags "$PKG" 2>/dev/null || true)
               RESOLVED=""; BESTKEY=""
               # Process substitution (not a pipe) so the loop runs in THIS shell and
               # RESOLVED/BESTKEY persist; works on macOS bash 3.2 (no mapfile).
@@ -129,7 +155,7 @@ runs:
           esac
           REF="${PKG}:${RESOLVED}"
           rm -rf "$DPX"; mkdir -p "$DPX"
-          if oras pull "$REF" -o "$DWIN" 2>/dev/null && [ -f "$DPX/cache.tar.gz" ]; then
+          if _cc_timeout 600 oras pull "$REF" -o "$DWIN" 2>/dev/null && [ -f "$DPX/cache.tar.gz" ]; then
             # Tarball stores absolute paths (-P); extract in place. Windows MSYS
             # tar needs --force-local + the POSIX archive path; macOS BSD tar has
             # neither the flag nor the bug (see save/action.yml).

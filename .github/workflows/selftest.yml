@@ -47,6 +47,9 @@ jobs:
         with:
           package: ghcr.io/cirisai/ciriscache-selftest
           key: selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # alias-keys retags the SAME pushed manifest (no second tar+push).
+          # Restored-by-alias below to prove the retag lands byte-identical.
+          alias-keys: selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}-alias
           paths: "~/.cargo/registry/cache target/deps"
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -127,3 +130,25 @@ jobs:
           test "${{ steps.pfx.outputs.cache-hit }}" = "true" || { echo "prefix: expected a HIT via most-recent match"; exit 1; }
           cmp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
           echo "✅ prefix most-recent (*) verified on ${{ matrix.os }} — resolved '${{ steps.pfx.outputs.key }}'"
+
+      # alias-keys (CIRISPersist#458): the Save above pushed the blob under the
+      # primary key and RETAGGED it as `…-alias` server-side (no re-upload).
+      # Restoring by the alias key must HIT and come back byte-identical — proof
+      # the retag lands the same manifest on every runner OS.
+      - name: Wipe again before alias restore
+        shell: bash
+        run: rm -rf ~/.cargo/registry/cache target
+      - name: Restore (alias-keys — retagged manifest)
+        id: alias
+        uses: ./restore
+        with:
+          package: ghcr.io/cirisai/ciriscache-selftest
+          key: selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}-alias
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.alias.outputs.cache-hit }}" = "true" || { echo "alias: expected the retagged alias key to HIT"; exit 1; }
+          cmp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
+          grep -q "marker-${GITHUB_SHA}" target/deps/ciriscache_marker.txt
+          echo "✅ alias-keys retag verified on ${{ matrix.os }} (push-once + retag → byte-identical restore-by-alias)"

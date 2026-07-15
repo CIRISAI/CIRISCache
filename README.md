@@ -60,6 +60,27 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the design, the honest granularity
 ceiling (this is coarse whole-dir caching, not sccache per-crate addressing),
 and the one-time package setup.
 
+## Multi-key: push once, alias the rest (`alias-keys`)
+
+When one build's `target/` must be reachable under **several keys** — e.g. a
+versioned exact-pin *and* a rolling `phead` for cross-version incremental
+restore — don't run `save` twice. A second `save` re-tars, re-gzips and
+re-uploads the byte-identical directory (a large `target/` serializes several
+minutes each). Instead push once and pass the extra tags to `alias-keys`; they
+are applied as a registry-side `oras tag` of the pushed digest (~1 s, no blob
+re-upload):
+
+```yaml
+  - uses: CIRISAI/CIRISCache/save@v1
+    with:
+      key: ciris-substrate-v1-linux-x86_64-...-p17.5.0-v10.2.0   # primary blob
+      alias-keys: ciris-substrate-v1-linux-x86_64-...-phead-v10.2.0   # retag, no re-push
+      token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+An alias that already exists is moved to the new manifest (correct for a rolling
+`phead`). A retag failure is non-fatal — the primary save still counts.
+
 ## Why not R2 / S3 / sccache-remote?
 
 Those work, but each adds an external account + credential = another point of
