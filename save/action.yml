@@ -28,6 +28,21 @@ inputs:
   paths:
     description: "Space-separated dirs to cache. `~` and workspace-relative paths are expanded."
     default: "~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db target"
+  max-size-mb:
+    description: >
+      Optional target/-size budget in MB. When set (and GNU find is
+      available — i.e. the Linux lanes, where the fat-blob pain lives), the
+      save prunes the OLDEST-mtime files under target/ until the total is
+      within budget BEFORE tarring. This breaks the cache RATCHET
+      (restore(fat) -> build -> save(fat+)): stale artifact generations —
+      e.g. an entire superseded dependency-version set after a re-pin —
+      are restored, never rebuilt, and re-saved forever, growing the blob
+      and every download+extract on every lane. LRU-by-mtime means a
+      reused-but-ancient artifact may take ONE forced recompile and then
+      re-enters with a fresh mtime — mild steady-state churn in exchange
+      for a bounded blob. Empty (default) = disabled. Never touches
+      ~/.cargo (registry/git are lockfile-keyed, not generational).
+    default: ""
   token:
     description: >
       GHCR token with write:packages. Pass the job's GITHUB_TOKEN (the
@@ -105,6 +120,31 @@ runs:
         # the unconverted RUNNER_TEMP (cd "$TMP" lands in the same physical dir).
         TMP="${RUNNER_TEMP}"; FL=""
         if [ "${RUNNER_OS:-}" = "Windows" ]; then TMP="$(cygpath -u "${RUNNER_TEMP}")"; FL="--force-local"; fi
+        # ── LRU prune (see max-size-mb input) ─────────────────────────────
+        if [ -n "${{ inputs.max-size-mb }}" ] && [ -d "$GITHUB_WORKSPACE/target" ] \
+           && find --version >/dev/null 2>&1; then
+          BUDGET_KB=$(( ${{ inputs.max-size-mb }} * 1024 ))
+          T="$GITHUB_WORKSPACE/target"
+          USED_KB=$(du -sk "$T" | cut -f1)
+          if [ "$USED_KB" -gt "$BUDGET_KB" ]; then
+            echo "CIRISCache: target/ ${USED_KB}KB over ${BUDGET_KB}KB budget — LRU prune"
+            # Oldest-mtime first; delete until within budget. %T@ (GNU find)
+            # + a size column so we can stop exactly at the line.
+            find "$T" -type f -printf '%T@ %k %p\n' 2>/dev/null | sort -n | \
+            while read -r _mt kb path; do
+              [ "$USED_KB" -le "$BUDGET_KB" ] && break
+              rm -f -- "$path" 2>/dev/null || continue
+              USED_KB=$(( USED_KB - kb ))
+            done
+            # The subshell above cannot export USED_KB; re-measure honestly.
+            AFTER_KB=$(du -sk "$T" | cut -f1)
+            echo "CIRISCache: pruned target/ ${USED_KB}KB→${AFTER_KB}KB (budget ${BUDGET_KB}KB)"
+          else
+            echo "CIRISCache: target/ ${USED_KB}KB within ${BUDGET_KB}KB budget — no prune"
+          fi
+        elif [ -n "${{ inputs.max-size-mb }}" ]; then
+          echo "CIRISCache: max-size-mb set but GNU find unavailable — prune skipped (fail-open)"
+        fi
         tar $FL -czPf "$TMP/cache.tar.gz" $EXP
         cd "$TMP"
         _cc_timeout 1200 oras push "$REF" cache.tar.gz:application/gzip
