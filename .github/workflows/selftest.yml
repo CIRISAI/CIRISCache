@@ -54,6 +54,10 @@ jobs:
           paths: "~/.cargo/registry/cache target/deps"
           token: ${{ secrets.GITHUB_TOKEN }}
           strict: "true"   # a failed save must red the selftest
+          # Within budget, so nothing is pruned, but the prune branch still
+          # sources scripts/prune.sh via $GITHUB_ACTION_PATH on every OS that
+          # has GNU find (CIRISCache#3).
+          max-size-mb: "1024"
 
       - name: Assert published
         shell: bash
