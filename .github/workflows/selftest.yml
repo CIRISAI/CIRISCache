@@ -43,6 +43,7 @@ jobs:
           cp ~/.cargo/registry/cache/blob.bin ~/ciriscache_blob.before
 
       - name: Save
+        id: save
         uses: ./save
         with:
           package: ghcr.io/cirisai/ciriscache-selftest
@@ -52,6 +53,17 @@ jobs:
           alias-keys: selftest-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}-alias
           paths: "~/.cargo/registry/cache target/deps"
           token: ${{ secrets.GITHUB_TOKEN }}
+          strict: "true"   # a failed save must red the selftest
+          # Within budget, so nothing is pruned, but the prune branch still
+          # sources scripts/prune.sh via $GITHUB_ACTION_PATH on every OS that
+          # has GNU find (CIRISCache#3).
+          max-size-mb: "1024"
+
+      - name: Assert published
+        shell: bash
+        run: |
+          test "${{ steps.save.outputs.published }}" = "true" \
+            || { echo "save did not publish: ${{ steps.save.outputs.reason }}"; exit 1; }
 
       - name: Wipe local copies
         shell: bash

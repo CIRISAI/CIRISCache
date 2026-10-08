@@ -42,6 +42,8 @@ inputs:
       re-enters with a fresh mtime — mild steady-state churn in exchange
       for a bounded blob. Empty (default) = disabled. Never touches
       ~/.cargo (registry/git are lockfile-keyed, not generational).
+      Implemented in scripts/prune.sh; a prune failure is reported like any
+      other failed stage (see `published`).
     default: ""
   token:
     description: >
@@ -50,6 +52,30 @@ inputs:
       — the repo must be granted write access to the package once (see
       docs/DESIGN.md). No PAT / org secret required.
     required: true
+  strict:
+    description: >
+      "true" = a failed save is an `::error::` and fails the step. Default
+      "false" = fail-open: a failed save is an `::warning::`, the step exits 0
+      and `published` is "false". Either way the reason is in `reason`.
+    default: "false"
+
+outputs:
+  published:
+    description: >
+      "true" only when the blob was pushed under `key` (alias retags are
+      best-effort and do not change it). "false" on any failure or when there
+      was nothing to cache. Gate on THIS, not on the step's outcome: under the
+      default fail-open (`strict: "false"`) or a caller's `continue-on-error`,
+      a failed save does not fail the job.
+    value: ${{ steps.push.outputs.published }}
+  reason:
+    description: >
+      Why `published` is "false" (e.g. `prune failed (exit 2)`, `oras push
+      failed (exit 124)`, `nothing to cache`); empty when published.
+    value: ${{ steps.push.outputs.reason }}
+  key:
+    description: "The (normalized) cache key the save targets."
+    value: ${{ steps.k.outputs.key }}
 
 runs:
   using: composite
@@ -72,18 +98,55 @@ runs:
         echo "CIRISCache key: $KEY"
     - id: push
       shell: bash
+      # Inputs arrive as env, not `${{ }}` splices, so the script below is
+      # plain bash: tests/save_step_test.sh runs it verbatim with a stub oras.
       env:
         CIRISCACHE_TOKEN: ${{ inputs.token }}
+        CC_REF: ${{ steps.k.outputs.ref }}
+        CC_ACTOR: ${{ github.actor }}
+        CC_PATHS: ${{ inputs.paths }}
+        CC_ALIAS_KEYS: ${{ inputs.alias-keys }}
+        CC_MAX_SIZE_MB: ${{ inputs.max-size-mb }}
+        CC_STRICT: ${{ inputs.strict }}
       run: |
         set -euo pipefail
+        # A failed save must be LOUD (CIRISCache#3). Every stage below sets
+        # STAGE; the EXIT trap turns any non-zero exit into an annotation that
+        # names the stage, plus `published=false` / `reason=…` outputs the
+        # caller can gate on. Fail-open by default (warning, exit 0): a save is
+        # an optimisation and must not red a build. `strict: "true"` makes it
+        # an error that fails the step. Callers that still wrap save in
+        # `continue-on-error: true` get the same annotation — the old silent
+        # path (a red step hidden as success) is gone.
+        STAGE="setup"; PUBLISHED="false"
+        _cc_report() {
+          local rc=$?
+          trap - EXIT
+          [ "$rc" -eq 0 ] && return 0
+          local reason="$STAGE failed (exit $rc)"
+          if [ "$PUBLISHED" = "true" ]; then
+            # The blob is already up; only a best-effort tail step failed.
+            echo "::warning::CIRISCache: $reason after $CC_REF was published (non-fatal)"
+            exit 0
+          fi
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          if [ "${CC_STRICT:-false}" = "true" ]; then
+            echo "::error::CIRISCache: save NOT published for $CC_REF — $reason"
+            exit "$rc"
+          fi
+          echo "::warning::CIRISCache: save NOT published for $CC_REF — $reason (fail-open; check the 'published' output)"
+          exit 0
+        }
+        trap _cc_report EXIT
         # Portable step-internal timeout (CIRISPersist#458 — fail-open save). A
         # HUNG `oras push`/`oras tag` (dead GHCR / stalled upload) would otherwise
         # freeze the step until the JOB timeout, delaying (and on a tag run,
         # orphaning) the release. `timeout(1)` isn't portable (absent on macOS
         # runners; Windows `timeout.exe` differs), so use a bash watchdog: run in
         # the background, SIGTERM after N seconds, return the real rc (124 on
-        # watchdog fire). The caller wraps save in `continue-on-error: true`, so a
-        # timed-out push is non-fatal. Watchdog stdout → /dev/null so it can't
+        # watchdog fire). A timed-out push lands in the EXIT trap above as
+        # `oras push failed (exit 124)`. Watchdog stdout → /dev/null so it can't
         # hold a `$(…)` capture pipe open.
         _cc_timeout() {
           local secs="$1"; shift
@@ -93,15 +156,19 @@ runs:
           local wdpid=$!
           local rc=0
           wait "$cmdpid" 2>/dev/null || rc=$?
-          kill -TERM "$wdpid" 2>/dev/null
+          # `|| true`: once the watchdog has fired it has exited, and a kill of
+          # a dead pid must not trip `set -e` and mask the 124.
+          kill -TERM "$wdpid" 2>/dev/null || true
           wait "$wdpid" 2>/dev/null || true
           [ "$rc" -ge 128 ] && return 124
           return "$rc"
         }
-        REF="${{ steps.k.outputs.ref }}"
-        printf '%s' "${CIRISCACHE_TOKEN}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+        REF="$CC_REF"
+        STAGE="oras login"
+        printf '%s' "${CIRISCACHE_TOKEN}" | oras login ghcr.io -u "$CC_ACTOR" --password-stdin
+        STAGE="path expansion"
         EXP=""
-        for p in ${{ inputs.paths }}; do
+        for p in $CC_PATHS; do
           p="${p/#\~/$HOME}"
           case "$p" in /*) ;; *) p="$GITHUB_WORKSPACE/$p";; esac
           # Windows MSYS tar: normalize D:\a\... -> /d/a/... so there's no
@@ -113,7 +180,12 @@ runs:
           [ "${RUNNER_OS:-}" = "Windows" ] && p="$(cygpath -u "$p")"
           if [ -e "$p" ]; then EXP="$EXP $p"; else echo "CIRISCache: skip missing $p"; fi
         done
-        if [ -z "$EXP" ]; then echo "CIRISCache: nothing to cache"; exit 0; fi
+        if [ -z "$EXP" ]; then
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          echo "reason=nothing to cache" >> "$GITHUB_OUTPUT"
+          echo "::warning::CIRISCache: nothing to cache for $REF (no path in 'paths' exists) — not published"
+          exit 0
+        fi
         # -P keeps absolute paths so restore lands them back in place. On Windows
         # use a POSIX archive path + --force-local (belt-and-suspenders); members
         # are already cygpath'd above. oras is a native Windows binary, so it gets
@@ -121,33 +193,31 @@ runs:
         TMP="${RUNNER_TEMP}"; FL=""
         if [ "${RUNNER_OS:-}" = "Windows" ]; then TMP="$(cygpath -u "${RUNNER_TEMP}")"; FL="--force-local"; fi
         # ── LRU prune (see max-size-mb input) ─────────────────────────────
-        if [ -n "${{ inputs.max-size-mb }}" ] && [ -d "$GITHUB_WORKSPACE/target" ] \
+        # The prune lives in scripts/prune.sh (cc_prune_lru) so
+        # tests/prune_test.sh can run it under this step's exact shell
+        # options. It reads its oldest-first list from a temp FILE, not a
+        # pipe: an early `break` out of `sort | while` SIGPIPEs sort, which
+        # under pipefail killed this step before tar/push (CIRISCache#3).
+        if [ -n "$CC_MAX_SIZE_MB" ] && [ -d "$GITHUB_WORKSPACE/target" ] \
            && find --version >/dev/null 2>&1; then
-          BUDGET_KB=$(( ${{ inputs.max-size-mb }} * 1024 ))
-          T="$GITHUB_WORKSPACE/target"
-          USED_KB=$(du -sk "$T" | cut -f1)
-          if [ "$USED_KB" -gt "$BUDGET_KB" ]; then
-            echo "CIRISCache: target/ ${USED_KB}KB over ${BUDGET_KB}KB budget — LRU prune"
-            # Oldest-mtime first; delete until within budget. %T@ (GNU find)
-            # + a size column so we can stop exactly at the line.
-            find "$T" -type f -printf '%T@ %k %p\n' 2>/dev/null | sort -n | \
-            while read -r _mt kb path; do
-              [ "$USED_KB" -le "$BUDGET_KB" ] && break
-              rm -f -- "$path" 2>/dev/null || continue
-              USED_KB=$(( USED_KB - kb ))
-            done
-            # The subshell above cannot export USED_KB; re-measure honestly.
-            AFTER_KB=$(du -sk "$T" | cut -f1)
-            echo "CIRISCache: pruned target/ ${USED_KB}KB→${AFTER_KB}KB (budget ${BUDGET_KB}KB)"
-          else
-            echo "CIRISCache: target/ ${USED_KB}KB within ${BUDGET_KB}KB budget — no prune"
-          fi
-        elif [ -n "${{ inputs.max-size-mb }}" ]; then
+          STAGE="prune"
+          AP="$GITHUB_ACTION_PATH"
+          [ "${RUNNER_OS:-}" = "Windows" ] && AP="$(cygpath -u "$AP")"
+          # shellcheck source=../scripts/prune.sh
+          . "$AP/../scripts/prune.sh"
+          TMPDIR="$TMP" cc_prune_lru "$GITHUB_WORKSPACE/target" $(( CC_MAX_SIZE_MB * 1024 ))
+        elif [ -n "$CC_MAX_SIZE_MB" ]; then
           echo "CIRISCache: max-size-mb set but GNU find unavailable — prune skipped (fail-open)"
         fi
+        STAGE="tar"
+        # shellcheck disable=SC2086  # $FL and $EXP are word lists by design
         tar $FL -czPf "$TMP/cache.tar.gz" $EXP
         cd "$TMP"
+        STAGE="oras push"
         _cc_timeout 1200 oras push "$REF" cache.tar.gz:application/gzip
+        PUBLISHED="true"
+        echo "published=true" >> "$GITHUB_OUTPUT"
+        echo "reason=" >> "$GITHUB_OUTPUT"
         echo "CIRISCache: saved $REF ($(du -h cache.tar.gz | cut -f1))"
         # Registry-side retag: point each alias key at the SAME manifest we just
         # pushed — no re-tar / re-gzip / re-upload of the (byte-identical)
@@ -156,8 +226,9 @@ runs:
         # `phead`). CIRISPersist#458: the double ~9-min save was two full
         # tar+push cycles of identical content; this collapses it to push-once +
         # alias. A retag failure is non-fatal — the primary $REF is already saved.
+        STAGE="alias retag"
         PKG="${REF%:*}"
-        for ALIAS in ${{ inputs.alias-keys }}; do
+        for ALIAS in $CC_ALIAS_KEYS; do
           ALIAS=$(printf '%s' "$ALIAS" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | cut -c1-128)
           [ -z "$ALIAS" ] && continue
           if _cc_timeout 60 oras tag "$REF" "$ALIAS"; then
