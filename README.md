@@ -81,6 +81,50 @@ re-upload):
 An alias that already exists is moved to the new manifest (correct for a rolling
 `phead`). A retag failure is non-fatal — the primary save still counts.
 
+## Did the save publish? (`published`, `strict`)
+
+A save is fail-open by default: if any stage fails (oras login, the
+`max-size-mb` prune, tar, oras push or its 20-minute timeout) the step emits a
+`::warning::` naming the stage, sets `published=false` and `reason`, and exits
+0 so the build stays green. A retag failure after the push is also a warning,
+and `published` stays `true` (the primary key is up).
+
+| output | value |
+|---|---|
+| `published` | `true` only when the blob was pushed under `key` |
+| `reason` | why not, e.g. `prune failed (exit 2)`, `oras push failed (exit 124)`, `nothing to cache`; empty when published |
+| `key` | the normalized key the save targeted |
+
+**Check `published`, not the step's outcome.** Fail-open means a failed save
+does not fail the job, and neither does a caller's `continue-on-error: true`.
+Before CIRISCache#3 a save could fail on every run for weeks behind
+`continue-on-error` with nothing but a hidden red step to show for it. You no
+longer need `continue-on-error` on `save`; if you keep it, the warning is still
+emitted. Where a missing blob must red the build (a release that downstream
+repos exact-pin), set `strict: "true"`: the failure becomes an `::error::` and
+fails the step. Or gate a later step on the output:
+
+```yaml
+  - uses: CIRISAI/CIRISCache/save@v1
+    id: save
+    with:
+      key: ${{ env.CACHE_KEY }}
+      token: ${{ secrets.GITHUB_TOKEN }}
+  - if: steps.save.outputs.published != 'true'
+    run: |
+      echo "::error::cache not published: ${{ steps.save.outputs.reason }}"
+      exit 1
+```
+
+## Tests
+
+`bash tests/prune_test.sh` and `bash tests/save_step_test.sh` (bash, coreutils,
+GNU find; no registry) run on every PR via `.github/workflows/test.yml`. The
+first checks the LRU prune under the step's `bash -e -o pipefail`, with SIGPIPE
+both default and ignored as on the runner. The second runs the save step's
+script verbatim with a stub `oras` and checks every failure path's annotation
+and outputs. `selftest.yml` is the live GHCR round-trip.
+
 ## Why not R2 / S3 / sccache-remote?
 
 Those work, but each adds an external account + credential = another point of
